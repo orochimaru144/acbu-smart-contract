@@ -5,12 +5,12 @@ use soroban_sdk::{
 };
 
 use shared::{
-    any_circuit_peer_paused, calculate_fee, check_oracle_freshness, reentrancy_guard,
-    validate_circuit_peers, BurnEvent, ContractError,
-    ContractPhase, CurrencyCode, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION,
-    DECIMALS, MIN_BURN_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS, ORACLE_GET_BASKET_WEIGHT,
-    ORACLE_GET_CURRENCIES, ORACLE_GET_RATE_WITH_TS, ORACLE_GET_S_TOKEN_ADDR,
-    MINTING_RECORD_BURN, RESERVE_IS_SUFFICIENT, TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
+    any_circuit_peer_paused, calculate_fee, check_oracle_freshness, is_account_address,
+    reentrancy_guard, validate_circuit_peers, BurnEvent, ContractError, ContractPhase,
+    CurrencyCode, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION, DECIMALS,
+    MINTING_RECORD_BURN, MIN_BURN_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS, ORACLE_GET_BASKET_WEIGHT,
+    ORACLE_GET_CURRENCIES, ORACLE_GET_RATE_WITH_TS, ORACLE_GET_S_TOKEN_ADDR, RESERVE_IS_SUFFICIENT,
+    TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
 };
 
 #[contracttype]
@@ -52,7 +52,6 @@ const DATA_KEY: DataKey = DataKey {
     circuit_peers: symbol_short!("CB_PEERS"),
     minting_contract: symbol_short!("MINTING"),
 };
-
 
 contractmeta!(key = "version", val = "1");
 
@@ -126,7 +125,9 @@ impl BurningContract {
         env.storage()
             .instance()
             .set(&SharedDataKey::Version, &CONTRACT_VERSION);
-        env.storage().instance().set(&DATA_KEY.phase, &ContractPhase::Active);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.phase, &ContractPhase::Active);
         env.storage()
             .instance()
             .set(&DATA_KEY.min_burn_amount, &MIN_BURN_AMOUNT);
@@ -151,7 +152,6 @@ impl BurningContract {
         currency: CurrencyCode,
         min_stoken_out: Option<i128>,
     ) -> i128 {
-
         Self::check_circuit(&env);
         user.require_auth();
         Self::validate_recipient(&env, &recipient);
@@ -208,12 +208,11 @@ impl BurningContract {
             vec![&env, currency.clone().into_val(&env)],
         );
 
-        let fee = calculate_fee(acbu_amount, fee_single)
-            .unwrap_or_else(|e| env.panic_with_error(e));
+        let fee =
+            calculate_fee(acbu_amount, fee_single).unwrap_or_else(|e| env.panic_with_error(e));
         let net_acbu = acbu_amount
             .checked_sub(fee)
             .expect("Underflow in net acbu calculation");
-
 
         let stoken_out = net_acbu
             .checked_mul(acbu_rate)
@@ -228,7 +227,7 @@ impl BurningContract {
         }
 
         // AC-008: same guard as redeem_basket around the value-moving calls.
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
@@ -237,8 +236,8 @@ impl BurningContract {
 
         let token = soroban_sdk::token::Client::new(&env, &stoken);
         let spender = env.current_contract_address();
+        Self::assert_vault_allowance(&env, &token, &vault, &spender, stoken_out);
         token.transfer_from(&spender, &vault, &recipient, &stoken_out);
-
 
         let burn_event = BurnEvent {
             transaction_id: SorobanString::from_str(&env, "redeem_single"),
@@ -254,7 +253,6 @@ impl BurningContract {
         env.events()
             .publish((symbol_short!("burn"), user), burn_event);
 
-        reentrancy_guard::release_guard(&env);
         stoken_out
     }
 
@@ -289,6 +287,7 @@ impl BurningContract {
         }
 
         for i in 0..recipients.len() {
+            Self::validate_recipient(&env, &recipients.get(i).unwrap());
             for j in (i + 1)..recipients.len() {
                 if recipients.get(i).unwrap() == recipients.get(j).unwrap() {
                     env.panic_with_error(ContractError::InvalidRecipient);
@@ -358,8 +357,8 @@ impl BurningContract {
             env.panic_with_error(ContractError::InvalidRate);
         }
 
-        let total_fee = calculate_fee(acbu_amount, fee_rate)
-            .unwrap_or_else(|e| env.panic_with_error(e));
+        let total_fee =
+            calculate_fee(acbu_amount, fee_rate).unwrap_or_else(|e| env.panic_with_error(e));
         let net_acbu = acbu_amount
             .checked_sub(total_fee)
             .expect("Underflow in net acbu");
@@ -397,7 +396,9 @@ impl BurningContract {
                 let (pf_usd_i, pf_gross_i, pf_fee_i) = if pf_last_positive == Some(i) {
                     (
                         usd_total.checked_sub(pf_allocated_usd).expect("pf usd"),
-                        acbu_amount.checked_sub(pf_allocated_gross).expect("pf gross"),
+                        acbu_amount
+                            .checked_sub(pf_allocated_gross)
+                            .expect("pf gross"),
                         total_fee.checked_sub(pf_allocated_fee).expect("pf fee"),
                     )
                 } else {
@@ -407,9 +408,15 @@ impl BurningContract {
                         Self::weighted_floor(total_fee, weight, total_weight),
                     )
                 };
-                pf_allocated_usd = pf_allocated_usd.checked_add(pf_usd_i).expect("pf alloc usd");
-                pf_allocated_gross = pf_allocated_gross.checked_add(pf_gross_i).expect("pf alloc gross");
-                pf_allocated_fee = pf_allocated_fee.checked_add(pf_fee_i).expect("pf alloc fee");
+                pf_allocated_usd = pf_allocated_usd
+                    .checked_add(pf_usd_i)
+                    .expect("pf alloc usd");
+                pf_allocated_gross = pf_allocated_gross
+                    .checked_add(pf_gross_i)
+                    .expect("pf alloc gross");
+                pf_allocated_fee = pf_allocated_fee
+                    .checked_add(pf_fee_i)
+                    .expect("pf alloc fee");
                 let pf_net_i = pf_gross_i.checked_sub(pf_fee_i).expect("pf net");
                 let pf_native_i = pf_net_i
                     .checked_mul(acbu_rate)
@@ -512,6 +519,7 @@ impl BurningContract {
             if native_i > 0 {
                 let token = soroban_sdk::token::Client::new(&env, &stoken);
                 let spender = env.current_contract_address();
+                Self::assert_vault_allowance(&env, &token, &vault, &spender, native_i);
                 token.transfer_from(&spender, &vault, &recipient, &native_i);
             }
             amounts_out.push_back(native_i);
@@ -534,8 +542,6 @@ impl BurningContract {
         amounts_out
     }
 
-
-
     /// Step 1 of two-step admin rotation — nominates `new_admin` and starts the
     /// timelock. The current admin must call this; `new_admin` calls
     /// [`Self::accept_admin`] after the timelock elapses.
@@ -550,10 +556,8 @@ impl BurningContract {
             .instance()
             .set(&DATA_KEY.pending_admin_eligible_at, &eligible_at);
         let current_admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
-        env.events().publish(
-            (symbol_short!("adm_init"),),
-            (current_admin, new_admin, eligible_at),
-        );
+        env.events()
+            .publish((symbol_short!("adm_init"),), (current_admin, new_admin, eligible_at));
     }
 
     /// Step 2 of two-step admin rotation — the nominated address claims ownership
@@ -602,12 +606,9 @@ impl BurningContract {
             .instance()
             .remove(&DATA_KEY.pending_admin_eligible_at);
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
-        env.events().publish(
-            (symbol_short!("adm_cncl"),),
-            (admin, env.ledger().timestamp()),
-        );
+        env.events()
+            .publish((symbol_short!("adm_cncl"),), (admin, env.ledger().timestamp()));
     }
-
 
     /// Returns the current admin address.
     pub fn get_admin(env: Env) -> Address {
@@ -619,7 +620,9 @@ impl BurningContract {
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();
         Self::extend_instance_ttl(&env);
-        env.storage().instance().set(&DATA_KEY.phase, &ContractPhase::Paused);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.phase, &ContractPhase::Paused);
         let event = PauseEvent {
             admin,
             timestamp: env.ledger().timestamp(),
@@ -632,7 +635,9 @@ impl BurningContract {
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();
         Self::extend_instance_ttl(&env);
-        env.storage().instance().set(&DATA_KEY.phase, &ContractPhase::Active);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.phase, &ContractPhase::Active);
         let event = PauseEvent {
             admin,
             timestamp: env.ledger().timestamp(),
@@ -644,7 +649,6 @@ impl BurningContract {
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DATA_KEY.pending_admin)
     }
-
 
     /// Returns the timestamp after which [`Self::accept_admin`] becomes callable.
     pub fn get_pending_admin_eligible_at(env: Env) -> Option<u64> {
@@ -668,9 +672,10 @@ impl BurningContract {
         if let Err(e) = validate_circuit_peers(&env, &peers) {
             env.panic_with_error(e);
         }
-        env.storage().instance().set(&DATA_KEY.circuit_peers, &peers);
-        env.events()
-            .publish((symbol_short!("cb_peers"),), peers);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.circuit_peers, &peers);
+        env.events().publish((symbol_short!("cb_peers"),), peers);
     }
 
     /// Link the minting contract whose supply tracker is decremented on every
@@ -745,18 +750,12 @@ impl BurningContract {
 
     /// Returns the ACBU token contract address.
     pub fn get_acbu_token(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DATA_KEY.acbu_token)
-            .unwrap()
+        env.storage().instance().get(&DATA_KEY.acbu_token).unwrap()
     }
 
     /// Returns the oracle contract address.
     pub fn get_oracle(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DATA_KEY.oracle)
-            .unwrap()
+        env.storage().instance().get(&DATA_KEY.oracle).unwrap()
     }
 
     /// Returns the reserve tracker contract address.
@@ -777,10 +776,7 @@ impl BurningContract {
 
     /// Returns the vault contract address.
     pub fn get_vault(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DATA_KEY.vault)
-            .unwrap()
+        env.storage().instance().get(&DATA_KEY.vault).unwrap()
     }
 
     /// Returns the minimum ACBU amount required for a redemption.
@@ -834,11 +830,8 @@ impl BurningContract {
     }
 
     fn check_reserves(env: &Env, acbu_token: &Address, reserve_tracker_addr: &Address) {
-        let current_supply: i128 = env.invoke_contract(
-            acbu_token,
-            &Symbol::new(env, TOKEN_GET_TOTAL_SUPPLY),
-            vec![env],
-        );
+        let current_supply: i128 =
+            env.invoke_contract(acbu_token, &Symbol::new(env, TOKEN_GET_TOTAL_SUPPLY), vec![env]);
         let reserve_ok: bool = env.invoke_contract(
             reserve_tracker_addr,
             &Symbol::new(env, RESERVE_IS_SUFFICIENT),
@@ -892,9 +885,27 @@ impl BurningContract {
         admin.require_auth();
     }
 
+    /// Redeem recipients must be `G…` accounts, the same rule the minting
+    /// contract applies (AC-031). This also rejects this contract's own
+    /// address, since contract addresses are `C…`.
     fn validate_recipient(env: &Env, recipient: &Address) {
-        if *recipient == env.current_contract_address() {
+        if !is_account_address(recipient) {
             env.panic_with_error(ContractError::InvalidRecipient);
+        }
+    }
+
+    /// Panics with `VaultAllowanceInsufficient` if the vault has not granted the
+    /// burning contract a spender allowance of at least `required` on `token`.
+    fn assert_vault_allowance(
+        env: &Env,
+        token: &soroban_sdk::token::Client,
+        vault: &Address,
+        spender: &Address,
+        required: i128,
+    ) {
+        let allowance = token.allowance(vault, spender);
+        if allowance < required {
+            env.panic_with_error(ContractError::VaultAllowanceInsufficient);
         }
     }
 

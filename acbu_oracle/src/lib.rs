@@ -510,6 +510,13 @@ impl OracleContract {
             .get(&DATA_KEY.min_signatures)
             .unwrap();
 
+        if sources.len() > 0 {
+            let required = min_sigs.max(MIN_ORACLE_SOURCE_FEEDS);
+            if sources.len() < required {
+                env.panic_with_error(OracleError::InsufficientOracleSources);
+            }
+        }
+
         // ── Emergency bypass logic (SC-025) ──────────────────────────────────
         //
         // A single validator can no longer unilaterally bypass the time-lock.

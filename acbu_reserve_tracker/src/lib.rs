@@ -22,15 +22,15 @@ pub enum ReserveTrackerError {
     AdminTimelockNotElapsed = 8005,
     NoPendingAdminToCancel = 8006,
     Unauthorized = 8007,
-    AttestationNotFound = 8008,
-    InvalidMerkleProof = 8009,
-    InvalidCustodian = 8010,
-    AttestationExpired = 8011,
-    NonPositiveAmount = 8014,
-    InconsistentReserve = 8015,
-    DuplicateCurrency = 8016,
-    NoPendingUpgrade = 8012,
-    TimelockNotElapsed = 8013,
+    DuplicateCurrency = 8008,
+    AttestationNotFound = 8009,
+    InvalidMerkleProof = 8010,
+    InvalidCustodian = 8011,
+    AttestationExpired = 8012,
+    NoPendingUpgrade = 8013,
+    TimelockNotElapsed = 8014,
+    NonPositiveAmount = 8015,
+    InconsistentReserve = 8016,
     OracleStale = 8017,
     Unknown = 8999,
 }
@@ -132,10 +132,14 @@ const UPGRADE_TIMELOCK_SECONDS: u64 = 86_400;
 /// Only one verify_reserves call is allowed per this cooldown period.
 const VERIFY_RESERVES_COOLDOWN_SECONDS: u64 = 60;
 
-/// Maximum age of an attestation before external systems should consider
-/// it stale. The custodian is expected to submit fresh attestations within
-/// this window. 24 hours.
-#[allow(dead_code)]
+/// Maximum age of an attestation before it is considered stale and reserves
+/// are no longer trusted. The custodian is expected to submit a fresh
+/// Merkle-root attestation within this window. 24 hours.
+///
+/// Used in [`ReserveTrackerContract::is_reserve_sufficient`] to implement the
+/// AC-023 / SC-015 attestation gating: if no attestation exists, or the most
+/// recent one is older than this value, `is_reserve_sufficient` returns `false`,
+/// blocking all minting and burning until a fresh attestation is submitted.
 const ATTESTATION_MAX_AGE_SECONDS: u64 = 86_400;
 
 /// Allowed deviation between the admin-reported `value_usd` and the value
@@ -372,10 +376,43 @@ impl ReserveTrackerContract {
     /// supply valued at the oracle's ACBU/USD rate. Always `false` while the
     /// reserve circuit breaker is tripped (see [`Self::pause`]); otherwise
     /// trivially `true` when supply is non-positive or values to zero.
+    ///
+    /// **AC-023 / SC-015 — Attestation gating:** This function is fail-closed with
+    /// respect to the Merkle attestation.  Before trusting any admin-reported reserve
+    /// values it verifies that:
+    ///
+    /// 1. A Merkle-root attestation has been submitted by the custodian (i.e.
+    ///    `attestation_ts` is present in storage), and
+    /// 2. The attestation is not older than `ATTESTATION_MAX_AGE_SECONDS` (24 h).
+    ///
+    /// If either condition is not met the function returns `false`, blocking minting
+    /// and burning until the custodian submits a fresh attestation.  This ensures
+    /// that the external, verifiable source of truth (SC-015) actively gates every
+    /// reserve check rather than being dead code.
     pub fn is_reserve_sufficient(env: Env, total_acbu_supply: i128) -> bool {
         if Self::is_paused(env.clone()) {
             return false;
         }
+
+        // ── AC-023 / SC-015: Attestation freshness gate ──────────────────────
+        // Fail closed: if no attestation has ever been submitted, or the most
+        // recent one is older than ATTESTATION_MAX_AGE_SECONDS, treat reserves
+        // as untrustworthy and block mint / burn.
+        let attestation_ts: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.attestation_ts);
+        match attestation_ts {
+            None => return false, // No attestation ever submitted
+            Some(ts) => {
+                let now = env.ledger().timestamp();
+                if now.saturating_sub(ts) > ATTESTATION_MAX_AGE_SECONDS {
+                    return false; // Attestation has expired
+                }
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         if total_acbu_supply <= 0 {
             return true;
         }
@@ -403,8 +440,15 @@ impl ReserveTrackerContract {
             .expect("Overflow in ACBU USD calculation")
             .checked_div(DECIMALS)
             .expect("Division by zero in ACBU USD calculation");
+        // AC-042: When total_acbu_usd rounds to zero the oracle rate is either
+        // zero (stale / uninitialized) or the supply is so small that a full
+        // reserve check cannot be performed.  Returning `true` here would be a
+        // trivial bypass — any caller could trigger this path with a tiny
+        // supply and empty reserves.  We return `false` so that minting is
+        // blocked until a valid, positive oracle rate is available and the
+        // reserve-ratio check can proceed properly.
         if total_acbu_usd == 0 {
-            return true;
+            return false;
         }
 
         let min_reserve_ratio = env

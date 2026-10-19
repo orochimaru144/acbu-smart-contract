@@ -129,7 +129,6 @@ const ADMIN_TIMELOCK_SECONDS: u64 = 86_400;
 const INSTANCE_TTL_THRESHOLD: u32 = 5_184_000;
 const INSTANCE_TTL_EXTEND_TO: u32 = 5_184_000;
 
-
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -260,11 +259,21 @@ impl SavingsVault {
             env.panic_with_error(Error::InvalidYieldRate);
         }
         env.storage().instance().set(&DATA_KEY.admin, &admin);
-        env.storage().instance().set(&DATA_KEY.acbu_token, &acbu_token);
-        env.storage().instance().set(&DATA_KEY.fee_rate, &fee_rate_bps);
-        env.storage().instance().set(&DATA_KEY.yield_rate, &yield_rate_bps);
-        env.storage().instance().set(&DATA_KEY.phase, &ContractPhase::Active);
-        env.storage().instance().set(&SharedDataKey::Version, &CONTRACT_VERSION);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.acbu_token, &acbu_token);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.fee_rate, &fee_rate_bps);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.yield_rate, &yield_rate_bps);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.phase, &ContractPhase::Active);
+        env.storage()
+            .instance()
+            .set(&SharedDataKey::Version, &CONTRACT_VERSION);
         Self::extend_instance_ttl(&env);
     }
 
@@ -306,17 +315,18 @@ impl SavingsVault {
         let token = soroban_sdk::token::Client::new(&env, &acbu);
         let vault_addr = env.current_contract_address();
 
-        // Transfer the net amount to the vault first, verifying success.
-        match token.try_transfer(&user, &vault_addr, &net_amount) {
+        // AC-037: Pull the full gross amount in a single transfer so the user
+        // only needs one approval for `amount`.  The fee is then forwarded
+        // from the vault to the admin in a second, vault-initiated transfer
+        // (no user auth required for that leg).
+        match token.try_transfer(&user, &vault_addr, &amount) {
             Ok(Ok(())) => {}
             _ => env.panic_with_error(Error::AccountingError),
         }
-        // Transfer the fee to the admin if applicable, verifying success.
+        // Forward the fee portion from vault to admin (vault-initiated, no
+        // additional user approval needed).
         if fee_amount > 0 {
-            match token.try_transfer(&user, &admin, &fee_amount) {
-                Ok(Ok(())) => {}
-                _ => env.panic_with_error(Error::AccountingError),
-            }
+            token.transfer(&vault_addr, &admin, &fee_amount);
         }
 
         // Record the deposit lot in storage after the transfers succeed
@@ -352,7 +362,6 @@ impl SavingsVault {
                 maturity_timestamp,
             },
         );
-
 
         net_amount
     }
@@ -478,7 +487,6 @@ impl SavingsVault {
             (user, amount, 0i128, yield_paid, now),
         );
 
-
         payout_amount
     }
 
@@ -530,7 +538,7 @@ impl SavingsVault {
     /// short (AC-007). Pays as much as the reserve currently covers; any
     /// remainder stays owed. Returns the amount paid.
     pub fn claim_yield(env: Env, user: Address) -> i128 {
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
         user.require_auth();
         Self::check_paused(&env);
 
@@ -558,7 +566,6 @@ impl SavingsVault {
         env.events()
             .publish((symbol_short!("yld_clm"), user), (paid, remaining));
 
-        reentrancy_guard::release_guard(&env);
         paid
     }
 
